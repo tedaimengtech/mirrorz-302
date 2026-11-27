@@ -142,6 +142,19 @@ func (e *Endpoint) UnmarshalJSON(data []byte) error {
 
 // Match checks if the endpoint can serve the request.
 func (e *Endpoint) Match(m requestmeta.RequestMeta) (reason string, ok bool) {
+	return e.match(m, nil)
+}
+
+// MatchForTrace checks the endpoint and returns a rejection message safe for JSON traces.
+func (e *Endpoint) MatchForTrace(m requestmeta.RequestMeta) (reason, traceReason string, ok bool) {
+	reason, ok = e.match(m, &traceReason)
+	if !ok && traceReason == "" {
+		traceReason = reason
+	}
+	return
+}
+
+func (e *Endpoint) match(m requestmeta.RequestMeta, traceReason *string) (reason string, ok bool) {
 	// Requests without a repository list sites for the scoring API.
 	if m.CName != "" {
 		if slices.Contains(e.Blacklist, m.CName) {
@@ -152,6 +165,11 @@ func (e *Endpoint) Match(m requestmeta.RequestMeta) (reason string, ok bool) {
 		}
 		if !m.Mirrorlist {
 			if _, err := e.Redirects[m.CName].Apply(m.Tail); err != nil {
+				if traceReason != nil {
+					if rule, ok := err.(pathRuleError); ok {
+						*traceReason = rule.traceMessage()
+					}
+				}
 				return err.Error(), false
 			}
 		} else if len(e.Redirects[m.CName].Rewrite) > 0 {

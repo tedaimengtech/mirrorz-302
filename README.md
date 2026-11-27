@@ -231,7 +231,7 @@ declared root; a blacklist does not remove a site with a declared root.
 Global normalization also applies to the repository portion of mirrorlist
 and scoring API requests. The cache shares monitor data by canonical cname
 and client preferences; each request applies its own path rules and scoring.
-`?trace=1` shows canonical paths, path exclusions, and the final target.
+`?trace=1` shows canonical paths, path exclusions, and the final target. Send `Accept: application/json` with the same request to get structured endpoint scores, rejections, and rankings instead of text.
 
 The deployed configuration belongs in mirrorz-config: global rules in
 `sites/global.json` and site rules in `sites/<site>/config.json`.
@@ -240,7 +240,7 @@ current recommendation to exclude that release.
 
 ### Note
 
-#### ：Select an endpoint by score rank
+#### Select an endpoint by score rank
 
 * `?nth=N` selects from all eligible endpoints in score order (default `0`). Invalid values return 400. If index `0` has no eligible endpoint, the response is 404; other out-of-range indices return 422.
 

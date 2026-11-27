@@ -73,6 +73,9 @@ func (s *Server) normalizeMeta(ctx context.Context, meta requestmeta.RequestMeta
 	}
 	tracer := ctx.Value(tracing.Key).(tracing.Tracer)
 	tracer.Printf("Request path: %s; canonical path: %s\n", input, canonical)
+	if trace := currentRedirectTrace(ctx); trace != nil {
+		trace.Request.CanonicalPath = canonical
+	}
 	meta.CName, meta.Tail = cname, ""
 	if len(parts) == 2 {
 		meta.Tail = "/" + parts[1]
@@ -86,7 +89,7 @@ func (s *Server) monitorResults(ctx context.Context, meta requestmeta.RequestMet
 	key := requestmeta.CacheKey(meta)
 	cached, status := s.resolved.Load(key)
 	tracer := ctx.Value(tracing.Key).(tracing.Tracer)
-	if status == caching.StatusFresh && cached.Source != nil && !tracer.Enabled() {
+	if status == caching.StatusFresh && cached.Source != nil && !tracer.Enabled() && currentRedirectTrace(ctx) == nil {
 		s.resolved.Touch(key)
 		return cached.Source, nil
 	}
@@ -136,6 +139,10 @@ func (s *Server) Resolve(ctx context.Context, meta requestmeta.RequestMeta, nth 
 				tracer.Printf("Site rewrite on %s: %s\n", endpoint.Label, rule)
 			}
 			tracer.Printf("nth=%d site=%s; Path on %s: %s -> %s; target: %s\n", nth, score.Abbr, endpoint.Label, meta.Tail, tail, target)
+			if trace := currentRedirectTrace(ctx); trace != nil {
+				trace.Result.Nth, trace.Result.Abbr = nth, score.Abbr
+				trace.Result.Tail, trace.Result.Target = tail, target
+			}
 			s.resolveLogger.Debugf("%s", tracer.String())
 			s.resolveLogger.Infof("R: %s %s %s\n", target, meta, score)
 			return target, nil
@@ -344,22 +351,46 @@ func (s *Server) resolveBest(ctx context.Context, res influxdb.Result, meta requ
 	tracer := ctx.Value(tracing.Key).(tracing.Tracer)
 	deltaCutoff := calcDeltaCutoff(s.eligibleForRequest(res, meta))
 	tracer.Printf("outdated thresholds: dynamic=%d absolute=%d\n", deltaCutoff, -s.maxRepoStaleness)
+	trace := currentRedirectTrace(ctx)
+	if trace != nil {
+		trace.OutdatedThresholds.Dynamic = deltaCutoff
+		trace.OutdatedThresholds.Absolute = -s.maxRepoStaleness
+	}
 
 	for _, item := range res {
 		abbr := item.Mirror
 		tracer.Printf("abbr: %s\n", abbr)
+		var mirror *traceMirror
+		if trace != nil {
+			mirror = trace.addMirror(abbr)
+		}
 		endpoints, ok := s.mirrorzd.Lookup(abbr)
 		if !ok {
 			continue
 		}
+		outdated := s.outdatedReason(item.Value, deltaCutoff)
 		var scoresEndpoints scoring.Scores
 		for _, endpoint := range endpoints {
 			tracer.Printf("  endpoint: %s %s %s %s\n", endpoint.Resolve, endpoint.Label, endpoint.RangeRegion, endpoint.RangeISP)
-			if reason := s.outdatedReason(item.Value, deltaCutoff); reason != "" {
-				tracer.Printf("    error: outdated: %s\n", reason)
+			var record *traceEndpoint
+			if mirror != nil {
+				record = mirror.addEndpoint(endpoint)
+			}
+			if outdated != "" {
+				tracer.Printf("    error: outdated: %s\n", outdated)
+				if record != nil {
+					record.Error = "outdated: " + outdated
+				}
 				continue
 			}
-			if reason, ok := endpoint.Match(meta); !ok {
+			var reason string
+			var matched bool
+			if record != nil {
+				reason, record.Error, matched = endpoint.MatchForTrace(meta)
+			} else {
+				reason, matched = endpoint.Match(meta)
+			}
+			if !matched {
 				tracer.Printf("    error: %s\n", reason)
 				continue
 			}
@@ -369,6 +400,9 @@ func (s *Server) resolveBest(ctx context.Context, res influxdb.Result, meta requ
 			// mirrorz-monitor encodes the U (unknown) main status as value 0.
 			score.Unknown = item.Value == 0
 			tracer.Printf("    score: %s\n", score)
+			if record != nil {
+				trace.recordScore(record, score, endpoint.Public)
+			}
 			scoresEndpoints = append(scoresEndpoints, score)
 		}
 
@@ -378,6 +412,9 @@ func (s *Server) resolveBest(ctx context.Context, res influxdb.Result, meta requ
 		}
 
 		scoresEndpoints.Sort()
+		if mirror != nil {
+			mirror.Scores = trace.rank(scoresEndpoints)
+		}
 		for i, score := range scoresEndpoints {
 			tracer.Printf("  score %d: %s\n", i, score)
 			// When mode == 1, keep only the best endpoint per site.
@@ -392,6 +429,9 @@ func (s *Server) resolveBest(ctx context.Context, res influxdb.Result, meta requ
 	}
 
 	scores.Sort()
+	if trace != nil {
+		trace.Scores = trace.rank(scores)
+	}
 	for i, score := range scores {
 		tracer.Printf("score %d: %s\n", i, score)
 	}

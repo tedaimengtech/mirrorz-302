@@ -163,6 +163,24 @@ func (r Redirects) Apply(tail string) (string, error) {
 	return target, err
 }
 
+// pathRuleError retains the detailed text diagnostic and can produce a public
+// message without exposing the rule expression or expanded target.
+type pathRuleError struct {
+	err     error
+	index   int
+	rewrite bool
+}
+
+func (e pathRuleError) Error() string { return e.err.Error() }
+func (e pathRuleError) Unwrap() error { return e.err }
+
+func (e pathRuleError) traceMessage() string {
+	if e.rewrite {
+		return fmt.Sprintf("rewrite[%d]: invalid target path", e.index)
+	}
+	return fmt.Sprintf("path blacklist[%d]", e.index)
+}
+
 // ApplyWithRule also returns the matching rewrite expression for tracing.
 func (r Redirects) ApplyWithRule(tail string) (string, string, error) {
 	path := tail
@@ -171,7 +189,7 @@ func (r Redirects) ApplyWithRule(tail string) (string, string, error) {
 	}
 	for i, pattern := range r.blacklist {
 		if pattern.MatchString(path) {
-			return "", "", fmt.Errorf("path blacklist[%d]: %s", i, r.Blacklist[i])
+			return "", "", pathRuleError{err: fmt.Errorf("path blacklist[%d]: %s", i, r.Blacklist[i]), index: i}
 		}
 	}
 	if len(r.whitelist) > 0 {
@@ -190,7 +208,7 @@ func (r Redirects) ApplyWithRule(tail string) (string, string, error) {
 		}
 		target := string(rule.pattern.ExpandString(nil, rule.Target, path, indices))
 		if err := ValidatePath(target); err != nil {
-			return "", "", fmt.Errorf("rewrite[%d]: %w", i, err)
+			return "", "", pathRuleError{err: fmt.Errorf("rewrite[%d]: %w", i, err), index: i, rewrite: true}
 		}
 		return target, rule.Match, nil
 	}

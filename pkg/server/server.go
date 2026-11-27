@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"mime"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -249,7 +248,7 @@ func (s *Server) redirectRoot(w http.ResponseWriter, r *http.Request) {
 			host = resolved
 		}
 	}
-	http.Redirect(w, r, fmt.Sprintf("%s://%s", s.meta.Scheme(r), host), http.StatusFound)
+	redirectResponse{location: fmt.Sprintf("%s://%s", s.meta.Scheme(r), host)}.write(s, w, r)
 }
 
 type redirectQuery struct {
@@ -259,9 +258,13 @@ type redirectQuery struct {
 }
 
 func parseRedirectQuery(u *url.URL) (redirectQuery, error) {
+	if u.RawQuery == "" {
+		return redirectQuery{}, nil
+	}
 	query := redirectQuery{rawQuery: u.RawQuery}
 	parts := strings.Split(u.RawQuery, "&")
 	nthIndex := -1
+	var nthErr error
 	for i, part := range parts {
 		params, err := url.ParseQuery(part)
 		if err != nil {
@@ -270,17 +273,15 @@ func parseRedirectQuery(u *url.URL) (redirectQuery, error) {
 		query.traceEnabled = query.traceEnabled || params.Has("trace")
 		if nthIndex == -1 && params.Has("nth") {
 			n, err := strconv.ParseUint(params.Get("nth"), 10, strconv.IntSize-1)
-			if err != nil {
-				return redirectQuery{}, err
-			}
-			query.nth, nthIndex = int(n), i
+			query.nth, nthIndex, nthErr = int(n), i, err
+			// Keep scanning for trace even when nth was invalid.
 		}
 	}
-	if nthIndex != -1 {
+	if nthIndex != -1 && nthErr == nil {
 		// Remove the consumed pair without re-encoding the rest.
 		query.rawQuery = strings.Join(slices.Delete(parts, nthIndex, nthIndex+1), "&")
 	}
-	return query, nil
+	return query, nthErr
 }
 
 // handleRedirect handles a regular mirrorz-302 request.
@@ -291,41 +292,17 @@ func (s *Server) handleRedirect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query, err := parseRedirectQuery(r.URL)
-	if err != nil {
-		writeError(w, r, http.StatusBadRequest, "invalid nth query")
-		return
+	response := newRedirectResponse(r, query, err)
+	if err == nil {
+		meta := s.meta.Parse(r)
+		ctx := response.traceContext(r, meta, query.nth)
+		// The plaintext diagnostics in the resolver are now only for server logs.
+		logTrace := query.traceEnabled && (s.resolveLogger.IsDebugEnabled() || s.failLogger.IsDebugEnabled())
+		ctx = context.WithValue(ctx, tracing.Key, tracing.NewTracer(logTrace))
+		target, resolveErr := s.Resolve(ctx, meta, query.nth)
+		response.setResolution(query, target, resolveErr)
 	}
-	tracer := tracing.NewTracer(query.traceEnabled)
-	ctx := context.WithValue(r.Context(), tracing.Key, tracer)
-	meta := s.meta.Parse(r)
-	url, err := s.Resolve(ctx, meta, query.nth)
-	if errors.Is(err, ErrNthOutOfRange) {
-		if query.nth != 0 {
-			writeError(w, r, http.StatusUnprocessableEntity, ErrNthOutOfRange.Error())
-			return
-		}
-		// No candidate at index zero: use the normal empty-target response.
-		err = nil
-	}
-	if err != nil {
-		tracer.Printf("error: %v\n", err)
-	}
-
-	if query.traceEnabled {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		tracer.WriteTo(w)
-	} else if errors.Is(err, ErrInvalidPath) {
-		writeError(w, r, http.StatusBadRequest, "Invalid repository path")
-	} else if err != nil {
-		writeError(w, r, http.StatusServiceUnavailable, "Mirror information is temporarily unavailable")
-	} else if url == "" {
-		writeError(w, r, http.StatusNotFound, "No mirror sites are available for this repository")
-	} else {
-		if query.rawQuery != "" {
-			url += "?" + query.rawQuery
-		}
-		http.Redirect(w, r, url, http.StatusFound)
-	}
+	response.write(s, w, r)
 }
 
 type ScoringAPIResponse struct {
@@ -349,38 +326,4 @@ func (s *Server) handleScoringAPI(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		s.errorLogger.Errorf("Error encoding response: %v", err)
 	}
-}
-
-func acceptsJSON(values []string) bool {
-	for _, value := range values {
-		for _, item := range strings.Split(value, ",") {
-			mediaType, params, err := mime.ParseMediaType(strings.TrimSpace(item))
-			if err != nil || mediaType != "application/json" {
-				continue
-			}
-			if quality, ok := params["q"]; ok {
-				q, err := strconv.ParseFloat(quality, 64)
-				if err != nil || !(q > 0 && q <= 1) {
-					continue
-				}
-			}
-			return true
-		}
-	}
-	return false
-}
-
-func writeError(w http.ResponseWriter, r *http.Request, status int, message string) {
-	w.Header().Add("Vary", "Accept")
-	if !acceptsJSON(r.Header.Values("Accept")) {
-		http.Error(w, message, status)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(struct {
-		Error string `json:"error"`
-	}{Error: message})
 }
